@@ -1,0 +1,21 @@
+[package]
+name = "library"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "edgevanelang"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+std = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+dlmalloc = { version = "0.2.14", features = ["global"] }
+libm = "0.2.16"
