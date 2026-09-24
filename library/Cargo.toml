@@ -1,17 +1,24 @@
 [package]
-name = "library"
+name = "edgevane_langdetect"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "no_std language detection engine (EVLC/EVLD): char/word n-grams, TF-IDF scoring, C API"
+license = "MIT"
+repository = "https://github.com/edgevane/languagedetect"
+homepage = "https://github.com/edgevane/languagedetect"
+documentation = "https://docs.rs/edgevane_langdetect"
+keywords = ["language", "detection", "nlp", "no_std", "ngram"]
+categories = ["text-processing", "no-std"]
+readme = "README.md"
+exclude = ["target/", "**/*.evld", "**/*.evlc"]
 
 [lib]
 name = "edgevanelang"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["std"]
 std = []
-
-[profile.dev]
-panic = "abort"
 
 [profile.release]
 panic = "abort"
