@@ -73,24 +73,32 @@ pub fn run(cli: &Cli) -> Result<()> {
     let idf = global_idf(&engines);
     println!("creator: global IDF over {} langs", engines.len());
 
-
-    let mut items: Vec<(String, Vec<u8>)> = Vec::with_capacity(engines.len());
-    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(engines.len());
-    for (lang, engine, _) in &engines {
+    // Finish + save one model at a time, dropping the heavy Engine
+    // right away so peak RAM stays flat. Combined is built at the
+    // end by re-reading the .evld files from disk.
+    let mut eval_docs: Vec<(&Lang, Vec<Box<str>>)> = Vec::with_capacity(engines.len());
+    let mut codes: Vec<String> = Vec::with_capacity(engines.len());
+    for (lang, engine, eval) in engines {
         let low = engine.docs < cli.max_docs as u32 / 2;
-        let blob = finish(engine, lang.code, low, &idf);
+        let blob = finish(&engine, lang.code, low, &idf);
         let path = PathBuf::from(&cli.out_dir).join(format!("{}.evld", lang.code));
         fs::write(&path, &blob).with_context(|| format!("write {}", path.display()))?;
         println!("  wrote {} ({} KB)", path.display(), blob.len() / 1024);
-        blobs.push(blob);
+        codes.push(lang.code.to_string());
+        eval_docs.push((lang, eval));
+        // `engine` and `blob` drop here, before the next language.
     }
+    drop(idf);
 
-    let mut dbs: Vec<LangDb> = Vec::with_capacity(engines.len());
-    for (i, (lang, _, _)) in engines.iter().enumerate() {
-        let db = LangDb::from_bytes(&blobs[i]).context("re-parse written blob")?;
-        assert_eq!(db.lang_code(), lang.code);
+    let mut dbs: Vec<LangDb> = Vec::with_capacity(codes.len());
+    let mut items: Vec<(String, Vec<u8>)> = Vec::with_capacity(codes.len());
+    for code in &codes {
+        let path = PathBuf::from(&cli.out_dir).join(format!("{code}.evld"));
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let db = LangDb::from_bytes(&bytes).context("re-parse written blob")?;
+        assert_eq!(db.lang_code(), code);
         dbs.push(db);
-        items.push((lang.code.to_string(), blobs[i].clone()));
+        items.push((code.clone(), bytes));
     }
 
     if !cli.no_combined {
@@ -103,9 +111,11 @@ pub fn run(cli: &Cli) -> Result<()> {
             bundle.len() / (1024 * 1024)
         );
     }
+    // `items` (all blobs in RAM) no longer needed; `dbs` stays for eval.
+    drop(items);
 
 
-    crate::eval::report(&dbs, &engines, cli.eval_docs);
+    crate::eval::report(&dbs, &eval_docs, cli.eval_docs);
     Ok(())
 }
 

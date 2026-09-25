@@ -10,7 +10,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 hf-hub = { version = "1.0.0", features = ["blocking"] }
 indicatif = "0.18.6"
-library = { version = "0.1.0", path = "../library", features = ["std"] }
+edgevane_langdetect = { version = "0.1.0", path = "../library", features = ["std"] }
 parquet = "60.0.0"
 rayon = "1.12.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls"] }
