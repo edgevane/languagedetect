@@ -1,3 +1,4 @@
+mod benchmark;
 mod cli;
 mod eval;
 mod langs;
@@ -12,8 +13,10 @@ use cli::Cli;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(w) = cli.workers {
-        rayon::ThreadPoolBuilder::new()
+    if let Some(path) = cli.benchmark.as_deref() {
+        return benchmark::run(path, cli.model.as_deref(), &cli.out_dir);
+    }
+    if let Some(w) = cli.workers {        rayon::ThreadPoolBuilder::new()
             .num_threads(w)
             .build_global()
             .map_err(|e| anyhow::anyhow!("rayon pool: {e}"))?;

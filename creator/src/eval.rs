@@ -1,5 +1,6 @@
 use edgevanelang::model::LangDb;
 use edgevanelang::score::classify;
+use rayon::prelude::*;
 
 
 pub fn report(
@@ -15,13 +16,14 @@ pub fn report(
             println!("  {:<3} no eval docs", lang.code);
             continue;
         }
-        let mut ok = 0usize;
-        for d in docs {
-            let ranked = classify(dbs, d);
-            if ranked.first().map(|s| s.lang_index) == Some(i) {
-                ok += 1;
-            }
-        }
+        // Score docs in parallel; classify is read-only over dbs.
+        let ok: usize = docs
+            .par_iter()
+            .map(|d| {
+                let ranked = classify(dbs, d);
+                (ranked.first().map(|s| s.lang_index) == Some(i)) as usize
+            })
+            .sum();
         tot_ok += ok;
         tot_n += docs.len();
         println!(

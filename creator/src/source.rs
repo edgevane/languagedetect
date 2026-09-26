@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -93,11 +93,18 @@ pub struct HttpChunkReader {
 impl HttpChunkReader {
 
     pub fn open(repo_id: &str, path: &str, token: Option<&str>, bar: ProgressBar) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("edgevanelang-creator/0.1")
-            .timeout(Duration::from_secs(300))
-            .build()
-            .context("http client")?;
+        static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+        let client = if let Some(c) = CLIENT.get() {
+            c.clone()
+        } else {
+            let c = reqwest::blocking::Client::builder()
+                .user_agent("edgevanelang-creator/0.1")
+                .timeout(Duration::from_secs(300))
+                .build()
+                .context("http client")?;
+            let _ = CLIENT.set(c.clone());
+            c
+        };
         let url = format!("https://huggingface.co/datasets/{repo_id}/resolve/main/{path}");
         let mut head = client.head(&url);
         if let Some(t) = token {

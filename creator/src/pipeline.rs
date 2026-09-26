@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::cli::Cli;
 use crate::langs::{self, Lang};
-use crate::read_parquet::{decode_text, parquet_text_index};
+use crate::read_parquet::decode_text_auto;
 use crate::source::{self, HttpChunkReader};
 
 fn docs_style() -> ProgressStyle {
@@ -148,7 +148,7 @@ fn build_one(
     let stride = (cli.max_docs / cli.eval_docs.max(1) as u64).max(1);
     let mut since_eval = 0u64;
     let done = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::sync_channel::<Result<Vec<Box<str>>>>(2);
+    let (tx, rx) = mpsc::sync_channel::<Result<Vec<Box<str>>>>(8);
 
     thread::scope(|s| -> Result<()> {
 
@@ -228,7 +228,7 @@ fn produce_job(
     match job {
         Job::Lines(path) => {
             let f = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
-            let mut buf: Vec<Box<str>> = Vec::with_capacity(4096);
+            let mut buf: Vec<Box<str>> = Vec::with_capacity(16384);
             for line in std::io::BufReader::new(f).lines() {
                 if done.load(Ordering::Relaxed) {
                     break;
@@ -238,7 +238,7 @@ fn produce_job(
                     continue;
                 }
                 buf.push(line.into());
-                if buf.len() >= 4096 {
+                if buf.len() >= 16384 {
                     if tx.send(Ok(std::mem::take(&mut buf))).is_err() {
                         break;
                     }
@@ -252,16 +252,14 @@ fn produce_job(
         }
         Job::LocalParquet(path) => {
             let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let idx = parquet_text_index(f.try_clone().context("clone file")?, text_col)?;
-            decode_channel(f, idx, done, tx)
+            decode_channel_auto(f, text_col, done, tx)
         }
         Job::Http { repo, path } => {
             let net_bar = mp.add(ProgressBar::new(0));
             net_bar.set_style(bytes_style());
             net_bar.set_message(short_name(path));
             let src = HttpChunkReader::open(repo, path, token, net_bar.clone())?;
-            let idx = parquet_text_index(src.clone(), text_col)?;
-            let r = decode_channel(src, idx, done, tx);
+            let r = decode_channel_auto(src, text_col, done, tx);
             let pulled = net_bar.position() as f64 / 1e6;
             let total = net_bar.length().unwrap_or(0) as f64 / 1e6;
             net_bar.finish_and_clear();
@@ -272,13 +270,13 @@ fn produce_job(
 }
 
 
-fn decode_channel<C: ChunkReader + 'static>(
+fn decode_channel_auto<C: ChunkReader + 'static>(
     src: C,
-    leaf_idx: usize,
+    text_col: &str,
     done: &Arc<AtomicBool>,
     tx: &mpsc::SyncSender<Result<Vec<Box<str>>>>,
 ) -> Result<()> {
-    decode_text(src, leaf_idx, |batch| {
+    decode_text_auto(src, text_col, |batch| {
         if done.load(Ordering::Relaxed) {
             return false;
         }

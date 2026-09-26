@@ -4,29 +4,27 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use parquet::file::reader::ChunkReader;
 
-const BATCH: usize = 4096;
+const BATCH: usize = 16384;
 
 
-pub(crate) fn parquet_text_index<C: ChunkReader + 'static>(
+/// Single-open variant: resolves `text_col` and streams in one pass,
+/// avoiding a second footer/metadata fetch (matters for HTTP).
+pub(crate) fn decode_text_auto<C: ChunkReader + 'static>(
     src: C,
     text_col: &str,
-) -> Result<usize> {
-    let probe = ParquetRecordBatchReaderBuilder::try_new(src).context("parquet open")?;
-    let mut leaves: Vec<String> = Vec::new();
-    collect_leaves(probe.parquet_schema().root_schema(), String::new(), &mut leaves);
-    leaves
-        .iter()
-        .position(|n| n == text_col || n.ends_with(&format!(".{text_col}")))
-        .with_context(|| format!("column '{text_col}' not found; leaves: {leaves:?}"))
-}
-
-
-pub(crate) fn decode_text<C: ChunkReader + 'static>(
-    src: C,
-    leaf_idx: usize,
     mut on_batch: impl FnMut(&[Box<str>]) -> bool,
 ) -> Result<u64> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(src).context("parquet open")?;
+    let mut leaves: Vec<String> = Vec::new();
+    collect_leaves(
+        builder.parquet_schema().root_schema(),
+        String::new(),
+        &mut leaves,
+    );
+    let leaf_idx = leaves
+        .iter()
+        .position(|n| n == text_col || n.ends_with(&format!(".{text_col}")))
+        .with_context(|| format!("column '{text_col}' not found; leaves: {leaves:?}"))?;
     let mask = ProjectionMask::leaves(builder.parquet_schema(), [leaf_idx]);
     let batches = builder
         .with_projection(mask)

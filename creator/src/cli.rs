@@ -39,4 +39,16 @@ pub struct Cli {
 
     #[arg(long)]
     pub hf_token: Option<String>,
+
+    /// Path to test.json / .jsonl for benchmark mode.
+    /// Each entry needs text + label, e.g.
+    /// {"text": "...", "lang": "pl"} (also accepts `label`/`code`/`expected`).
+    /// Supports a JSON array or JSON-lines file.
+    #[arg(long)]
+    pub benchmark: Option<String>,
+
+    /// Model file for benchmark (.evld single or combined).
+    /// Defaults to `<out_dir>/combined.evld`.
+    #[arg(long)]
+    pub model: Option<String>,
 }

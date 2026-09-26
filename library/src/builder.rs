@@ -67,10 +67,18 @@ impl Engine {
 
         const MAX_CHARS: usize = 65_536;
         let mut chars: Vec<u32> = Vec::new();
+        // Single pass: fold chars and accumulate class transitions inline,
+        // avoiding a second loop + char::from_u32 per codepoint.
+        let mut prev_cls: Option<usize> = None;
         for c in text.chars() {
             if chars.len() >= MAX_CHARS {
                 break;
             }
+            let cc = class_of(c) as usize;
+            if let Some(p) = prev_cls {
+                self.class_trans[p.min(CLASS_COUNT - 1)][cc.min(CLASS_COUNT - 1)] += 1;
+            }
+            prev_cls = Some(cc);
             fold_char(c, |f| {
                 if chars.len() < MAX_CHARS {
                     chars.push(f as u32);
@@ -104,16 +112,6 @@ impl Engine {
         let mut aff_n = 0usize;
         let mut prev_tok: Option<u32> = None;
         let mut sent_len = 0u32;
-        let mut prev_cls: Option<usize> = None;
-
-
-        for &cp in &chars {
-            let cc = class_of(char::from_u32(cp).unwrap_or('\u{FFFD}')) as usize;
-            if let Some(p) = prev_cls {
-                self.class_trans[p.min(CLASS_COUNT - 1)][cc.min(CLASS_COUNT - 1)] += 1;
-            }
-            prev_cls = Some(cc);
-        }
 
         let flush = |me: &mut Engine,
                          h: &mut u32,
