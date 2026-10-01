@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
@@ -76,6 +77,11 @@ struct Inner {
     cache: Mutex<BlockCache>,
     fetched: AtomicU64,
     bar: ProgressBar,
+    /// Optional dir for write-through block cache. Blocks fetched from the
+    /// network are stored as files, so a later reader (pass 2) gets them
+    /// from disk. Streaming behaviour is unchanged: blocks are still
+    /// fetched on demand, never as one full download.
+    persist: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -108,48 +114,36 @@ pub(crate) fn dataset_url(repo_id: &str, path: &str) -> String {
     format!("https://huggingface.co/datasets/{repo_id}/resolve/main/{path}")
 }
 
-/// Download a dataset file into `cache_dir` (once) and return its local path.
-/// Pass 2 then reads from disk instead of re-downloading.
-pub fn fetch_cached(
-    repo_id: &str,
-    path: &str,
-    token: Option<&str>,
-    cache_dir: &std::path::Path,
-    bar: ProgressBar,
-) -> Result<std::path::PathBuf> {
-    let safe_path: String = path.replace('/', "__");
-    let safe_repo: String = repo_id.replace('/', "__");
-    let dest = cache_dir.join(format!("{safe_repo}__{safe_path}"));
-    if dest.exists() {
-        bar.set_length(dest.metadata().map(|m| m.len()).unwrap_or(0));
-        bar.set_position(bar.length().unwrap_or(0));
-        bar.finish_and_clear();
-        return Ok(dest);
-    }
-    std::fs::create_dir_all(cache_dir).context("create cache_dir")?;
-    let tmp = dest.with_extension("part");
-    let client = shared_client()?;
-    let url = dataset_url(repo_id, path);
-    let mut req = client.get(&url);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    let mut resp = req.send().with_context(|| format!("GET {path}"))?;
-    anyhow::ensure!(resp.status().is_success(), "GET {path}: {}", resp.status());
-    if let Some(total) = resp.content_length() {
-        bar.set_length(total);
-    }
-    let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-    std::io::copy(&mut resp, &mut f).context("download body")?;
-    bar.set_position(bar.length().unwrap_or_else(|| f.metadata().map(|m| m.len()).unwrap_or(0)));
-    bar.finish_and_clear();
-    std::fs::rename(&tmp, &dest).context("finalize cached file")?;
-    Ok(dest)
-}
-
 impl HttpChunkReader {
 
     pub fn open(repo_id: &str, path: &str, token: Option<&str>, bar: ProgressBar) -> Result<Self> {
+        Self::open_inner(repo_id, path, token, bar, None)
+    }
+
+    /// Streaming reader with a write-through block cache in `cache_dir`.
+    /// Pass 1 streams from the network and fills the cache on the fly;
+    /// pass 2 opens the same location and reads blocks from disk.
+    pub fn open_cached(
+        repo_id: &str,
+        path: &str,
+        token: Option<&str>,
+        bar: ProgressBar,
+        cache_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let safe_repo: String = repo_id.replace('/', "__");
+        let safe_path: String = path.replace('/', "__");
+        let dir = cache_dir.join(format!("{safe_repo}__{safe_path}.blocks"));
+        std::fs::create_dir_all(&dir).context("create cache dir")?;
+        Self::open_inner(repo_id, path, token, bar, Some(dir))
+    }
+
+    fn open_inner(
+        repo_id: &str,
+        path: &str,
+        token: Option<&str>,
+        bar: ProgressBar,
+        persist: Option<PathBuf>,
+    ) -> Result<Self> {
         let client = shared_client()?;
         let url = dataset_url(repo_id, path);
         let mut head = client.head(&url);
@@ -169,8 +163,16 @@ impl HttpChunkReader {
                 cache: Mutex::new(BlockCache::default()),
                 fetched: AtomicU64::new(0),
                 bar,
+                persist,
             }),
         })
+    }
+
+    fn block_path(&self, idx: u64) -> Option<PathBuf> {
+        self.inner
+            .persist
+            .as_ref()
+            .map(|d| d.join(format!("blk_{idx:08x}")))
     }
 
     fn block(&self, idx: u64) -> Result<Bytes> {
@@ -179,6 +181,23 @@ impl HttpChunkReader {
             let cache = self.inner.cache.lock().unwrap();
             if let Some(b) = cache.map.get(&idx) {
                 return Ok(b.clone());
+            }
+        }
+        // Write-through cache: pass 2 reads this file instead of the network.
+        // Atomic write (tmp + rename) so an interrupted run never leaves
+        // a partial block behind.
+        if let Some(p) = self.block_path(idx) {
+            if let Ok(data) = std::fs::read(&p) {
+                let b = Bytes::from(data);
+                let mut cache = self.inner.cache.lock().unwrap();
+                if cache.map.len() >= MAX_BLOCKS {
+                    if let Some(old) = cache.order.pop_front() {
+                        cache.map.remove(&old);
+                    }
+                }
+                cache.order.push_back(idx);
+                cache.map.insert(idx, b.clone());
+                return Ok(b);
             }
         }
         let start = idx * BLOCK;
@@ -198,6 +217,12 @@ impl HttpChunkReader {
             resp.status()
         );
         let bytes = resp.bytes().context("range body")?;
+        if let Some(p) = self.block_path(idx) {
+            let tmp = p.with_extension("part");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
         let mut cache = self.inner.cache.lock().unwrap();
         if cache.map.len() >= MAX_BLOCKS {
             if let Some(old) = cache.order.pop_front() {

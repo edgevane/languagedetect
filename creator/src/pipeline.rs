@@ -82,19 +82,12 @@ pub fn run(cli: &Cli) -> Result<()> {
         docs_bar.set_message(lang.code.to_string());
         let (engine, _eval) = build_one(lang, cli, sources, cache_dir.as_deref(), &mp, &docs_bar)?;
         docs_bar.finish_and_clear();
-        println!(
-            "  {:<3} docs={:<8} tokens={:<12} (pass 1/2)",
-            lang.code,
-            engine.docs,
-            engine.tokens_total,
-        );
         df_keys.push(engine.token_df().keys().copied().collect());
         // `engine` + `_eval` drop here.
         total.inc(1);
     }
 
     let idf = global_idf_keys(&df_keys);
-    println!("creator: global IDF over {} langs", plans.len());
     // Key sets no longer needed.
     drop(df_keys);
 
@@ -120,10 +113,20 @@ pub fn run(cli: &Cli) -> Result<()> {
         );
         let blob = finish(&engine, lang.code, low, &idf);
         // Engine no longer needed once the blob is built.
+        let docs = engine.docs;
+        let toks = engine.tokens_total;
         drop(engine);
         let path = PathBuf::from(&cli.out_dir).join(format!("{}.evld", lang.code));
         fs::write(&path, &blob).with_context(|| format!("write {}", path.display()))?;
-        println!("  wrote {} ({} KB)", path.display(), blob.len() / 1024);
+        println!(
+            "  {:<3} docs={:<8} tokens={:<12} {}-> {} ({} KB)",
+            lang.code,
+            docs,
+            toks,
+            if low { "(low) " } else { "" },
+            path.display(),
+            blob.len() / 1024
+        );
         codes.push(lang.code.to_string());
         eval_docs.push((*lang, eval));
         total.inc(1);
@@ -134,21 +137,19 @@ pub fn run(cli: &Cli) -> Result<()> {
     // Pass 2 is done: cached parquets are no longer needed.
     // Remove only files fetched during this run, unless --leave-files.
     if let Some(dir) = cache_dir.as_deref() {
-        if cli.leave_files {
-            println!("creator: leaving cached files in {}", dir.display());
-        } else if let Ok(rd) = fs::read_dir(dir) {
-            let mut removed = 0u64;
-            for e in rd.flatten() {
-                let p = e.path();
-                if cache_before.contains(&p) {
-                    continue;
+        if !cli.leave_files {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if cache_before.contains(&p) {
+                        continue;
+                    }
+                    if p.is_dir() {
+                        let _ = fs::remove_dir_all(&p);
+                    } else {
+                        let _ = fs::remove_file(&p);
+                    }
                 }
-                if p.is_file() && fs::remove_file(&p).is_ok() {
-                    removed += 1;
-                }
-            }
-            if removed > 0 {
-                println!("creator: removed {removed} cached parquet files");
             }
         }
     }
@@ -345,7 +346,7 @@ fn produce_job(
                     if tx.send(Ok(std::mem::take(&mut buf))).is_err() {
                         break;
                     }
-                    buf = Vec::with_capacity(4096);
+                    buf = Vec::with_capacity(16384);
                 }
             }
             if !buf.is_empty() {
@@ -358,13 +359,15 @@ fn produce_job(
             decode_channel_auto(f, text_col, done, tx)
         }
         Job::CachedParquet { repo, path, dir } => {
-            // First pass downloads, second pass hits the local file.
-            let dl_bar = mp.add(ProgressBar::new(0));
-            dl_bar.set_style(bytes_style());
-            dl_bar.set_message(short_name(path));
-            let local = source::fetch_cached(repo, path, token, dir, dl_bar)?;
-            let f = fs::File::open(&local).with_context(|| format!("open {}", local.display()))?;
-            decode_channel_auto(f, text_col, done, tx)
+            // Pass 1 streams from the network and fills the block cache;
+            // pass 2 reads the same blocks straight from disk.
+            let net_bar = mp.add(ProgressBar::new(0));
+            net_bar.set_style(bytes_style());
+            net_bar.set_message(short_name(path));
+            let src = HttpChunkReader::open_cached(repo, path, token, net_bar.clone(), dir)?;
+            let r = decode_channel_auto(src, text_col, done, tx);
+            net_bar.finish_and_clear();
+            r
         }
         Job::Http { repo, path } => {
             let net_bar = mp.add(ProgressBar::new(0));
@@ -372,10 +375,7 @@ fn produce_job(
             net_bar.set_message(short_name(path));
             let src = HttpChunkReader::open(repo, path, token, net_bar.clone())?;
             let r = decode_channel_auto(src, text_col, done, tx);
-            let pulled = net_bar.position() as f64 / 1e6;
-            let total = net_bar.length().unwrap_or(0) as f64 / 1e6;
             net_bar.finish_and_clear();
-            println!("  pulled {pulled:.1} MB / {total:.0} MB ({path})");
             r
         }
     }
