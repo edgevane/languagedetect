@@ -51,4 +51,20 @@ pub struct Cli {
     /// Defaults to `<out_dir>/combined.evld`.
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Cache dir for downloaded parquet files. Defaults to `<out_dir>/.cache`.
+    /// Pass 2 re-reads the same files, so the cache turns the second
+    /// pass into local-speed I/O instead of a second download.
+    #[arg(long)]
+    pub cache_dir: Option<String>,
+
+    /// Disable the download cache (pass 2 re-downloads everything).
+    #[arg(long, default_value_t = false)]
+    pub no_cache: bool,
+
+    /// Keep downloaded parquet files in the cache dir after the build.
+    /// By default cached files fetched during this run are deleted
+    /// once pass 2 is done.
+    #[arg(long, visible_alias = "leave_files", default_value_t = false)]
+    pub leave_files: bool,
 }

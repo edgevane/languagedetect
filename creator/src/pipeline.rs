@@ -36,55 +36,122 @@ fn bytes_style() -> ProgressStyle {
 pub fn run(cli: &Cli) -> Result<()> {
     let wanted = langs::resolve(&cli.langs)?;
     fs::create_dir_all(&cli.out_dir).context("create out_dir")?;
+    let cache_dir: Option<PathBuf> = if cli.no_cache {
+        None
+    } else {
+        Some(match &cli.cache_dir {
+            Some(d) => PathBuf::from(d),
+            None => PathBuf::from(&cli.out_dir).join(".cache"),
+        })
+    };
+
+    // Snapshot pre-existing cache files so cleanup below only removes
+    // files fetched during this run (never the user's own files).
+    let cache_before: std::collections::HashSet<PathBuf> = match &cache_dir {
+        Some(dir) => fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+    // Plan inputs once: HF listing happens a single time even though
+    // the two passes below read the data twice.
+    let mut plans: Vec<(&Lang, Vec<JobSource>)> = Vec::with_capacity(wanted.len());
+    for lang in wanted {
+        plans.push((lang, plan_sources(lang, cli)?));
+    }
+    let n_langs = plans.len();
 
     let mp = MultiProgress::new();
-    let total = mp.add(ProgressBar::new(wanted.len() as u64));
+    let total = mp.add(ProgressBar::new((n_langs * 2) as u64));
     total.set_style(docs_style());
     total.set_message("all");
     println!(
         "creator: {} langs, cap {} docs/lang -> {}",
-        wanted.len(),
+        n_langs,
         cli.max_docs,
         cli.out_dir
     );
 
 
-    let mut engines: Vec<(&Lang, Engine, Vec<Box<str>>)> = Vec::with_capacity(wanted.len());
-    for lang in wanted {
+    // Pass 1: train each lang, keep only its token_df key set (small),
+    // drop the heavy Engine immediately. Peak RAM = one Engine.
+    let mut df_keys: Vec<Vec<u32>> = Vec::with_capacity(plans.len());
+    for (lang, sources) in &plans {
         let docs_bar = mp.add(ProgressBar::new(cli.max_docs));
         docs_bar.set_style(docs_style());
         docs_bar.set_message(lang.code.to_string());
-        let (engine, eval) = build_one(lang, cli, &mp, &docs_bar)?;
+        let (engine, _eval) = build_one(lang, cli, sources, cache_dir.as_deref(), &mp, &docs_bar)?;
+        docs_bar.finish_and_clear();
+        println!(
+            "  {:<3} docs={:<8} tokens={:<12} (pass 1/2)",
+            lang.code,
+            engine.docs,
+            engine.tokens_total,
+        );
+        df_keys.push(engine.token_df().keys().copied().collect());
+        // `engine` + `_eval` drop here.
+        total.inc(1);
+    }
+
+    let idf = global_idf_keys(&df_keys);
+    println!("creator: global IDF over {} langs", plans.len());
+    // Key sets no longer needed.
+    drop(df_keys);
+
+    // Pass 2: re-train each lang, finish + save immediately, drop Engine.
+    // Re-training the same docs in the same order yields the same state,
+    // so quality is unchanged vs the old single-pass build.
+    // With the download cache on, pass 2 reads from local disk.
+    let mut eval_docs: Vec<(&Lang, Vec<Box<str>>)> = Vec::with_capacity(plans.len());
+    let mut codes: Vec<String> = Vec::with_capacity(plans.len());
+    for (lang, sources) in &plans {
+        let docs_bar = mp.add(ProgressBar::new(cli.max_docs));
+        docs_bar.set_style(docs_style());
+        docs_bar.set_message(lang.code.to_string());
+        let (engine, eval) = build_one(lang, cli, sources, cache_dir.as_deref(), &mp, &docs_bar)?;
         docs_bar.finish_and_clear();
         let low = engine.docs < cli.max_docs as u32 / 2;
         println!(
-            "  {:<3} docs={:<8} tokens={:<12} {}",
+            "  {:<3} docs={:<8} tokens={:<12} {} (pass 2/2)",
             lang.code,
             engine.docs,
             engine.tokens_total,
             if low { "(low_resource)" } else { "" }
         );
-        engines.push((lang, engine, eval));
-        total.inc(1);
-    }
-    total.finish_and_clear();
-
-
-    let idf = global_idf(&engines);
-    println!("creator: global IDF over {} langs", engines.len());
-
-    let mut eval_docs: Vec<(&Lang, Vec<Box<str>>)> = Vec::with_capacity(engines.len());
-    let mut codes: Vec<String> = Vec::with_capacity(engines.len());
-    for (lang, engine, eval) in engines {
-        let low = engine.docs < cli.max_docs as u32 / 2;
         let blob = finish(&engine, lang.code, low, &idf);
+        // Engine no longer needed once the blob is built.
+        drop(engine);
         let path = PathBuf::from(&cli.out_dir).join(format!("{}.evld", lang.code));
         fs::write(&path, &blob).with_context(|| format!("write {}", path.display()))?;
         println!("  wrote {} ({} KB)", path.display(), blob.len() / 1024);
         codes.push(lang.code.to_string());
-        eval_docs.push((lang, eval));
+        eval_docs.push((*lang, eval));
+        total.inc(1);
     }
+    total.finish_and_clear();
     drop(idf);
+
+    // Pass 2 is done: cached parquets are no longer needed.
+    // Remove only files fetched during this run, unless --leave-files.
+    if let Some(dir) = cache_dir.as_deref() {
+        if cli.leave_files {
+            println!("creator: leaving cached files in {}", dir.display());
+        } else if let Ok(rd) = fs::read_dir(dir) {
+            let mut removed = 0u64;
+            for e in rd.flatten() {
+                let p = e.path();
+                if cache_before.contains(&p) {
+                    continue;
+                }
+                if p.is_file() && fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                println!("creator: removed {removed} cached parquet files");
+            }
+        }
+    }
 
     let mut items: Vec<(String, Vec<u8>)> = Vec::with_capacity(codes.len());
     for code in &codes {
@@ -114,33 +181,64 @@ pub fn run(cli: &Cli) -> Result<()> {
 }
 
 
-fn build_one(
-    lang: &Lang,
-    cli: &Cli,
-    mp: &MultiProgress,
-    docs_bar: &ProgressBar,
-) -> Result<(Engine, Vec<Box<str>>)> {
+/// Where a language's training docs come from. Planned once up front
+/// so HF listing + file discovery happen a single time for both passes.
+enum JobSource {
+    Lines(PathBuf),
+    LocalParquet(PathBuf),
+    Http { repo: String, path: String },
+}
 
-    let jobs: Vec<Job> = if let Some(dir) = &cli.from_text {
+fn plan_sources(lang: &Lang, cli: &Cli) -> Result<Vec<JobSource>> {
+    if let Some(dir) = &cli.from_text {
         let txt = PathBuf::from(dir).join(format!("{}.txt", lang.code));
         let pq = PathBuf::from(dir).join(format!("{}.parquet", lang.code));
         if pq.exists() {
-            vec![Job::LocalParquet(pq)]
-        } else {
-            vec![Job::Lines(txt)]
+            return Ok(vec![JobSource::LocalParquet(pq)]);
         }
-    } else {
-        let repo = source::open(lang.repo, cli.hf_token.as_deref())?;
-        let files = source::list_train_files(&repo, lang.prefixes)?;
-        println!("  {:<3} {} files in {}", lang.code, files.len(), lang.repo);
-        files
-            .into_iter()
-            .map(|path| Job::Http {
-                repo: lang.repo.to_string(),
-                path,
-            })
-            .collect()
-    };
+        return Ok(vec![JobSource::Lines(txt)]);
+    }
+    let repo = source::open(lang.repo, cli.hf_token.as_deref())?;
+    let files = source::list_train_files(&repo, lang.prefixes)?;
+    println!("  {:<3} {} files in {}", lang.code, files.len(), lang.repo);
+    Ok(files
+        .into_iter()
+        .map(|path| JobSource::Http {
+            repo: lang.repo.to_string(),
+            path,
+        })
+        .collect())
+}
+
+fn build_one(
+    _lang: &Lang,
+    cli: &Cli,
+    sources: &[JobSource],
+    cache_dir: Option<&std::path::Path>,
+    mp: &MultiProgress,
+    docs_bar: &ProgressBar,
+) -> Result<(Engine, Vec<Box<str>>)> {
+    let jobs: Vec<Job> = sources
+        .iter()
+        .map(|s| match s {
+            JobSource::Lines(p) => Job::Lines(p.clone()),
+            JobSource::LocalParquet(p) => Job::LocalParquet(p.clone()),
+            JobSource::Http { repo, path } => {
+                if let Some(dir) = cache_dir {
+                    Job::CachedParquet {
+                        repo: repo.clone(),
+                        path: path.clone(),
+                        dir: dir.to_path_buf(),
+                    }
+                } else {
+                    Job::Http {
+                        repo: repo.clone(),
+                        path: path.clone(),
+                    }
+                }
+            }
+        })
+        .collect();
 
     let mut engine = Engine::new();
     let mut eval: Vec<Box<str>> = Vec::new();
@@ -213,6 +311,11 @@ fn build_one(
 enum Job {
     Lines(PathBuf),
     LocalParquet(PathBuf),
+    CachedParquet {
+        repo: String,
+        path: String,
+        dir: PathBuf,
+    },
     Http { repo: String, path: String },
 }
 
@@ -254,6 +357,15 @@ fn produce_job(
             let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
             decode_channel_auto(f, text_col, done, tx)
         }
+        Job::CachedParquet { repo, path, dir } => {
+            // First pass downloads, second pass hits the local file.
+            let dl_bar = mp.add(ProgressBar::new(0));
+            dl_bar.set_style(bytes_style());
+            dl_bar.set_message(short_name(path));
+            let local = source::fetch_cached(repo, path, token, dir, dl_bar)?;
+            let f = fs::File::open(&local).with_context(|| format!("open {}", local.display()))?;
+            decode_channel_auto(f, text_col, done, tx)
+        }
         Job::Http { repo, path } => {
             let net_bar = mp.add(ProgressBar::new(0));
             net_bar.set_style(bytes_style());
@@ -290,11 +402,11 @@ fn short_name(path: &str) -> String {
 }
 
 
-fn global_idf(engines: &[(&Lang, Engine, Vec<Box<str>>)]) -> BTreeMap<u32, f32> {
-    let n = engines.len() as f32;
+fn global_idf_keys(df_keys: &[Vec<u32>]) -> BTreeMap<u32, f32> {
+    let n = df_keys.len() as f32;
     let mut df: HashMap<u32, u32> = HashMap::new();
-    for (_, e, _) in engines {
-        for (&tok, _) in e.token_df() {
+    for keys in df_keys {
+        for &tok in keys {
             *df.entry(tok).or_insert(0) += 1;
         }
     }

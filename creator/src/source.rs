@@ -90,22 +90,68 @@ pub struct HttpChunkReader {
     inner: Arc<Inner>,
 }
 
+pub(crate) fn shared_client() -> Result<reqwest::blocking::Client> {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c.clone());
+    }
+    let c = reqwest::blocking::Client::builder()
+        .user_agent("edgevanelang-creator/0.1")
+        .timeout(Duration::from_secs(300))
+        .build()
+        .context("http client")?;
+    let _ = CLIENT.set(c.clone());
+    Ok(c)
+}
+
+pub(crate) fn dataset_url(repo_id: &str, path: &str) -> String {
+    format!("https://huggingface.co/datasets/{repo_id}/resolve/main/{path}")
+}
+
+/// Download a dataset file into `cache_dir` (once) and return its local path.
+/// Pass 2 then reads from disk instead of re-downloading.
+pub fn fetch_cached(
+    repo_id: &str,
+    path: &str,
+    token: Option<&str>,
+    cache_dir: &std::path::Path,
+    bar: ProgressBar,
+) -> Result<std::path::PathBuf> {
+    let safe_path: String = path.replace('/', "__");
+    let safe_repo: String = repo_id.replace('/', "__");
+    let dest = cache_dir.join(format!("{safe_repo}__{safe_path}"));
+    if dest.exists() {
+        bar.set_length(dest.metadata().map(|m| m.len()).unwrap_or(0));
+        bar.set_position(bar.length().unwrap_or(0));
+        bar.finish_and_clear();
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_dir).context("create cache_dir")?;
+    let tmp = dest.with_extension("part");
+    let client = shared_client()?;
+    let url = dataset_url(repo_id, path);
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let mut resp = req.send().with_context(|| format!("GET {path}"))?;
+    anyhow::ensure!(resp.status().is_success(), "GET {path}: {}", resp.status());
+    if let Some(total) = resp.content_length() {
+        bar.set_length(total);
+    }
+    let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    std::io::copy(&mut resp, &mut f).context("download body")?;
+    bar.set_position(bar.length().unwrap_or_else(|| f.metadata().map(|m| m.len()).unwrap_or(0)));
+    bar.finish_and_clear();
+    std::fs::rename(&tmp, &dest).context("finalize cached file")?;
+    Ok(dest)
+}
+
 impl HttpChunkReader {
 
     pub fn open(repo_id: &str, path: &str, token: Option<&str>, bar: ProgressBar) -> Result<Self> {
-        static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-        let client = if let Some(c) = CLIENT.get() {
-            c.clone()
-        } else {
-            let c = reqwest::blocking::Client::builder()
-                .user_agent("edgevanelang-creator/0.1")
-                .timeout(Duration::from_secs(300))
-                .build()
-                .context("http client")?;
-            let _ = CLIENT.set(c.clone());
-            c
-        };
-        let url = format!("https://huggingface.co/datasets/{repo_id}/resolve/main/{path}");
+        let client = shared_client()?;
+        let url = dataset_url(repo_id, path);
         let mut head = client.head(&url);
         if let Some(t) = token {
             head = head.bearer_auth(t);
