@@ -50,6 +50,18 @@ pub const fn is_cyrillic(c: char) -> bool {
 
 
 pub fn class_of(c: char) -> Class {
+    // ponytail: ASCII table fast path; Unicode tables per char cost ~µs-scale
+    // lookups, upgrade only if profiler says non-Latin dominates.
+    let u = c as u32;
+    if u < 128 {
+        return match u as u8 {
+            b'a'..=b'z' => Class::Lower,
+            b'A'..=b'Z' => Class::Upper,
+            b'0'..=b'9' => Class::Digit,
+            b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' => Class::Space,
+            _ => Class::Punct,
+        };
+    }
     if c.is_whitespace() {
         return Class::Space;
     }
@@ -118,6 +130,33 @@ pub fn fold_char(c: char, mut emit: impl FnMut(char)) {
 
 pub const fn is_sentence_end(c: char) -> bool {
     matches!(c, '.' | '!' | '?' | '…' | '。' | '！' | '？' | '\n')
+}
+
+/// u32 variant for the fused ingest loop: folding never changes these
+/// codepoints (case folding only touches cased letters), so checking the
+/// folded value is equivalent and skips a second UTF-8 decode pass.
+pub const fn is_sentence_end_u32(u: u32) -> bool {
+    matches!(
+        u,
+        0x2E | 0x21 | 0x3F | 0x2026 | 0x3002 | 0xFF01 | 0xFF1F | 0x0A
+    )
+}
+
+/// u32 range variant of [`is_syllabic`]: pure integer compares, no tables.
+pub const fn is_syllabic_u32(u: u32) -> bool {
+    matches!(u,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0xF900..=0xFAFF
+        | 0x3040..=0x309F | 0x30A0..=0x30FF
+        | 0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F)
+}
+
+/// Folded ASCII letters are already lowercase; non-ASCII keeps table lookup.
+pub fn is_folded_alnum(u: u32) -> bool {
+    if u < 128 {
+        matches!(u as u8, b'a'..=b'z' | b'0'..=b'9')
+    } else {
+        char::from_u32(u).is_some_and(|c| c.is_alphabetic() || c.is_numeric())
+    }
 }
 
 

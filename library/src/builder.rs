@@ -7,7 +7,8 @@ use crate::format::{
 };
 use crate::hash::{fnv1a32, mix_u32};
 use crate::normalize::{
-    bin_len, class_of, fold_char, is_sentence_end, is_syllabic, CLASS_COUNT,
+    bin_len, class_of, fold_char, is_folded_alnum, is_sentence_end_u32, is_syllabic_u32,
+    CLASS_COUNT,
 };
 
 
@@ -32,6 +33,9 @@ pub struct Engine {
     class_trans: [[u64; CLASS_COUNT]; CLASS_COUNT],
 
     doc_tokens: Vec<u32>,
+    // ponytail: reusable scratch for per-doc sort-count; one heap buffer
+    // instead of an entry() tree walk per n-gram occurrence.
+    scratch: Vec<u32>,
 }
 
 impl Engine {
@@ -53,6 +57,7 @@ impl Engine {
             charpos: BTreeMap::new(),
             class_trans: [[0; CLASS_COUNT]; CLASS_COUNT],
             doc_tokens: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -87,9 +92,15 @@ impl Engine {
         }
         self.chars_total += chars.len() as u64;
 
-        for &cp in &chars {
-            *self.char_uni.entry(cp).or_insert(0) += 1;
-        }
+        // Sort-count: one entry() per unique n-gram per doc instead of one
+        // per occurrence. Doc vecs are small and cache-hot; the shared map
+        // is large and pointer-chasy.
+        let scratch = &mut self.scratch;
+        scratch.extend(chars.iter().copied());
+        count_into(&mut self.char_uni, scratch);
+        // bi/tri keys are ~unique per doc: sorting costs more than it saves,
+        // so these stay direct entry(). Only uni (tiny key domain, high
+        // repetition) goes through sort-count.
         let mut win = [0u8; 12];
         for (i, &cp) in chars.iter().enumerate() {
             if i >= 1 {
@@ -124,7 +135,6 @@ impl Engine {
                 return;
             }
             let th = *h;
-            *me.tok_uni.entry(th).or_insert(0) += 1;
             me.doc_tokens.push(th);
             me.tokens_total += 1;
             if let Some(p) = *prev_tok {
@@ -162,8 +172,11 @@ impl Engine {
             *tlen = 0;
         };
 
-        for c in text.chars() {
-            if is_sentence_end(c) {
+        // Fused tokenize pass over the already-folded units: folding only
+        // lowercases, so sentence-end / syllabic / alnum checks on folded
+        // values match the old two-pass behaviour bit-for-bit.
+        for &fu in chars.iter() {
+            if is_sentence_end_u32(fu) {
                 flush(
                     self, &mut h, &mut tlen, &aff, aff_n, &mut prev_tok, &mut sent_len,
                 );
@@ -175,47 +188,35 @@ impl Engine {
                 }
                 continue;
             }
-            let mut folded = [0u32; 3];
-            let mut nf = 0usize;
-            fold_char(c, |f| {
-                if nf < 3 {
-                    folded[nf] = f as u32;
-                    nf += 1;
+            if is_syllabic_u32(fu) {
+                flush(
+                    self, &mut h, &mut tlen, &aff, aff_n, &mut prev_tok, &mut sent_len,
+                );
+                aff_n = 0;
+                let th = fnv1a32(&fu.to_le_bytes());
+                self.doc_tokens.push(th);
+                self.tokens_total += 1;
+                if let Some(p) = prev_tok {
+                    *self.tok_bi.entry(mix_u32(p, th)).or_insert(0) += 1;
                 }
-            });
-            for k in 0..nf {
-                let fc = char::from_u32(folded[k]).unwrap_or('\u{FFFD}');
-                if is_syllabic(fc) {
-                    flush(
-                        self, &mut h, &mut tlen, &aff, aff_n, &mut prev_tok, &mut sent_len,
-                    );
-                    aff_n = 0;
-                    let th = fnv1a32(&folded[k].to_le_bytes());
-                    *self.tok_uni.entry(th).or_insert(0) += 1;
-                    self.doc_tokens.push(th);
-                    self.tokens_total += 1;
-                    if let Some(p) = prev_tok {
-                        *self.tok_bi.entry(mix_u32(p, th)).or_insert(0) += 1;
-                    }
-                    prev_tok = Some(th);
-                    self.wordlen[bin_len(1, 32)] += 1;
-                    sent_len += 1;
-                } else if fc.is_alphabetic() || fc.is_numeric() {
-                    for &byte in &folded[k].to_le_bytes() {
-                        h ^= byte as u32;
-                        h = h.wrapping_mul(0x0100_0193);
-                    }
-                    tlen += 1;
-                    if aff_n < 8 {
-                        aff[aff_n] = folded[k];
-                        aff_n += 1;
-                    }
-                } else {
-                    flush(
-                        self, &mut h, &mut tlen, &aff, aff_n, &mut prev_tok, &mut sent_len,
-                    );
-                    aff_n = 0;
+                prev_tok = Some(th);
+                self.wordlen[bin_len(1, 32)] += 1;
+                sent_len += 1;
+            } else if is_folded_alnum(fu) {
+                for &byte in &fu.to_le_bytes() {
+                    h ^= byte as u32;
+                    h = h.wrapping_mul(0x0100_0193);
                 }
+                tlen += 1;
+                if aff_n < 8 {
+                    aff[aff_n] = fu;
+                    aff_n += 1;
+                }
+            } else {
+                flush(
+                    self, &mut h, &mut tlen, &aff, aff_n, &mut prev_tok, &mut sent_len,
+                );
+                aff_n = 0;
             }
         }
         flush(
@@ -226,11 +227,21 @@ impl Engine {
         }
 
 
+        // doc_tokens holds one entry per token occurrence: a single sorted
+        // run pass yields both tok_uni counts and tok_df, replacing one
+        // entry() per token with one per unique token per doc.
         self.doc_tokens.sort_unstable();
-        self.doc_tokens.dedup();
         let dt = core::mem::take(&mut self.doc_tokens);
-        for th in dt {
+        let mut i = 0;
+        while i < dt.len() {
+            let th = dt[i];
+            let mut j = i + 1;
+            while j < dt.len() && dt[j] == th {
+                j += 1;
+            }
+            *self.tok_uni.entry(th).or_insert(0) += (j - i) as u64;
             *self.tok_df.entry(th).or_insert(0) += 1;
+            i = j;
         }
     }
 
@@ -264,6 +275,24 @@ impl Engine {
     pub fn token_df(&self) -> &BTreeMap<u32, u64> {
         &self.tok_df
     }
+}
+
+fn count_into(map: &mut BTreeMap<u32, u64>, buf: &mut Vec<u32>) {
+    if buf.is_empty() {
+        return;
+    }
+    buf.sort_unstable();
+    let mut i = 0;
+    while i < buf.len() {
+        let k = buf[i];
+        let mut j = i + 1;
+        while j < buf.len() && buf[j] == k {
+            j += 1;
+        }
+        *map.entry(k).or_insert(0) += (j - i) as u64;
+        i = j;
+    }
+    buf.clear();
 }
 
 fn merge_map<K: Ord>(dst: &mut BTreeMap<K, u64>, src: BTreeMap<K, u64>) {
